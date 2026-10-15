@@ -1,0 +1,23 @@
+[package]
+name = "ali-wan3-tool"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = "0.4"
+gpui-kit = "0.7"
+image = { version = "0.25", default-features = false, features = ["bmp", "jpeg", "png", "webp"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "3", features = ["json"] }
+
+[profile.release]
+strip = "symbols"
+panic = "abort"
+
+[profile.release-lto]
+inherits = "release"
+codegen-units = 1
+lto = "fat"
