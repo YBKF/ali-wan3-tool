@@ -153,6 +153,21 @@ pub fn text_input(
     })
 }
 
+/// 把滚轮滚动限制在内部：内层滚动到顶/底之后，滚轮滚动不再传给外层容器。
+///
+/// 等价于 CSS 的 `overscroll-behavior: contain`。
+///
+/// gpui 派发滚轮事件时按「内层 → 外层」倒序遍历监听器，但内层滚动完毕后并不拦截事件，
+/// 于是内外层会一起滚动。这里套一个只挂滚轮监听的包装元素：它排在内外层之间，
+/// 内层先滚动完，冒泡到这里就把事件截断，外层接收不到。
+pub fn scroll_contained(child: impl IntoElement) -> AnyElement {
+    div()
+        .w_full()
+        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+        .child(child)
+        .into_any_element()
+}
+
 /// 限定取值范围的数字输入框。
 pub fn number_input(
     window: &mut Window,

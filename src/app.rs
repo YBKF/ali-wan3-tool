@@ -753,7 +753,7 @@ impl WanApp {
         let body = v_flex()
             .gap_2()
             .w_full()
-            .child(Textarea::new(&self.prompt).w_full())
+            .child(ui::scroll_contained(Textarea::new(&self.prompt).w_full()))
             .child(ui::hint(
                 p,
                 "最多 20000 字符；用「图1」「图2」指代参考图的排列顺序。",
@@ -777,12 +777,11 @@ impl WanApp {
         let list: AnyElement = if count == 0 {
             ui::hint(
                 p,
-                "还没有参考图：点击「选择本地图片」，或把图片直接拖进窗口，也可以粘贴公网图片地址。",
+                "还没有参考图：点击「选择本地图片」，或把图片直接拖进这个区域，也可以粘贴公网的图片地址。",
             )
         } else {
-            List::new(&self.list_state)
-                .max_h(px(ui::IMAGE_LIST_MAX_HEIGHT))
-                .into_any_element()
+            // 列表滚到边界后，滚轮不再带动外面整页
+            ui::scroll_contained(List::new(&self.list_state).max_h(px(ui::IMAGE_LIST_MAX_HEIGHT)))
         };
 
         let controls = h_flex()
@@ -1114,7 +1113,7 @@ impl Render for WanApp {
             });
         }
 
-        // 没配 API Key 时首帧自动弹出连接设置
+        // 未配置 API Key 时自动弹出连接设置
         if !self.settings_auto_opened {
             self.settings_auto_opened = true;
             if self.api_key.read(cx).value().trim().is_empty() {
@@ -1154,4 +1153,3 @@ impl Render for WanApp {
             .child(footer)
     }
 }
-
