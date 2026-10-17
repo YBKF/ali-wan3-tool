@@ -16,11 +16,6 @@ use std::time::Duration;
 const CREATE_PATH: &str = "/api/v1/services/aigc/video-generation/video-synthesis";
 const TASK_PATH: &str = "/api/v1/tasks/";
 
-/// 官方建议的轮询间隔
-pub const POLL_SECS: u64 = 15;
-/// 最长轮询次数，约 40 分钟
-pub const MAX_POLLS: u32 = 160;
-
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 

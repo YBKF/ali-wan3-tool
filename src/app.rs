@@ -6,22 +6,18 @@
 //! - 提示词单独存到 prompt.txt，停止输入 3 秒后自动保存
 
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui_kit::base::StyledExt;
 use gpui_kit::component::Sizable;
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, IndexPath, WindowExt as _,
+    Disableable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     dialog::DialogFooter,
     h_flex,
     input::{Input, InputEvent, InputState, NumberInput, Textarea, TextareaState},
-    label::Label,
-    list::{List, ListDelegate, ListItem, ListState},
+    list::{List, ListState},
     notification::Notification,
     progress::Progress,
     switch::Switch,
@@ -29,447 +25,34 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    AnyElement, App, ClickEvent, Context, ElementId, Entity, ExternalPaths, Hsla, ObjectFit,
-    PathPromptOptions, Pixels, Render, SharedString, Subscription, WeakEntity, Window, div, img,
-    px,
+    AnyElement, ClickEvent, Context, Entity, ExternalPaths, PathPromptOptions, Render,
+    SharedString, Subscription, Window, div, px,
 };
 
-use crate::api::{self, CreateRequest, MediaItem, Parameters, RequestInput, TaskOutcome, Usage};
+use crate::api::{self, CreateRequest, MediaItem, Parameters, RequestInput, Usage};
 use crate::config::{Config, MAX_DURATION, MIN_DURATION, MODELS, RATIOS, REGIONS, RESOLUTIONS};
 use crate::media::{self, RefImage};
+use crate::ref_images::RefImagesDelegate;
+use crate::settings::SettingsForm;
+use crate::task::{
+    self, Debouncer, Phase, PhaseKind, PollOutcome, ResultInfo, download_with_progress, offload,
+    poll_until_done, update_view, write_after_debounce,
+};
+use crate::ui::{self, Palette};
 
 /// 提示词停止输入后多久落盘
 const PROMPT_SAVE_DELAY: Duration = Duration::from_secs(3);
 /// 参数修改后多久落盘（防抖，连续点击只写一次）
 const CONFIG_SAVE_DELAY: Duration = Duration::from_millis(400);
+/// 轮询期间每几次查询记一条通知，避免刷屏
+const POLL_LOG_EVERY: u32 = 4;
 
-#[derive(Clone, Copy)]
-struct Palette {
-    bg: Hsla,
-    fg: Hsla,
-    primary: Hsla,
-    muted_fg: Hsla,
-    border: Hsla,
-    danger: Hsla,
-    radius_lg: Pixels,
-}
-
-impl Palette {
-    fn new(cx: &App) -> Self {
-        let theme = cx.theme();
-        Self {
-            bg: theme.background,
-            fg: theme.foreground,
-            primary: theme.primary,
-            muted_fg: theme.muted_foreground,
-            border: theme.border,
-            danger: theme.danger,
-            radius_lg: theme.radius_lg,
-        }
-    }
-}
-
-#[derive(Clone)]
-enum Phase {
-    Idle,
-    Submitting,
-    Polling { status: SharedString, polls: u32 },
-    Downloading { received: u64, total: u64 },
-    Done,
-    Failed(SharedString),
-}
-
-struct ResultInfo {
-    video_url: String,
-    saved: Option<PathBuf>,
-    usage: Option<Usage>,
-    elapsed: String,
-}
-
-// ------------------------------------------------------------------ 通用渲染部件
-
-fn section(
-    p: &Palette,
-    title: &'static str,
-    hint: Option<&'static str>,
-    body: AnyElement,
-) -> AnyElement {
-    let mut head = v_flex().gap_1().child(Label::new(title));
-    if let Some(hint) = hint {
-        head = head.child(div().text_sm().text_color(p.muted_fg).child(hint));
-    }
-    v_flex()
-        .gap_3()
-        .p_4()
-        .w_full()
-        .rounded(p.radius_lg)
-        .border_1()
-        .border_color(p.border)
-        .child(head)
-        .child(body)
-        .into_any_element()
-}
-
-fn field_row(p: &Palette, label: &str, control: AnyElement) -> AnyElement {
-    v_flex()
-        .gap_2()
-        .w_full()
-        .child(
-            div()
-                .text_sm()
-                .text_color(p.muted_fg)
-                .child(SharedString::from(label.to_string())),
-        )
-        .child(control)
-        .into_any_element()
-}
-
-fn options_row<T, F>(
-    prefix: &'static str,
-    options: &[(&'static str, &'static str)],
-    selected: &str,
-    cx: &mut Context<T>,
-    on_pick: F,
-) -> AnyElement
-where
-    T: 'static,
-    F: Fn(&mut T, &'static str, &mut Context<T>) + Clone + 'static,
-{
-    let buttons: Vec<AnyElement> = options
-        .iter()
-        .map(|(label, value)| {
-            let value: &'static str = value;
-            let active = value == selected;
-            let handler = on_pick.clone();
-            let id = ElementId::Name(format!("{prefix}:{value}").into());
-            let button = Button::new(id).label(SharedString::from(*label));
-            let button = if active {
-                button.primary()
-            } else {
-                button.outline()
-            };
-            button
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    handler(this, value, cx);
-                    cx.notify();
-                }))
-                .into_any_element()
-        })
-        .collect();
-
-    h_flex()
-        .flex_wrap()
-        .gap_2()
-        .children(buttons)
-        .into_any_element()
-}
-
-// ------------------------------------------------------------------ 连接设置弹窗
-
-/// 弹窗内容做成独立视图，改动地域后能立刻重绘（弹窗 builder 不保证重跑）。
-struct SettingsForm {
-    owner: WeakEntity<WanApp>,
-    api_key: Entity<InputState>,
-    workspace_id: Entity<InputState>,
-    output_dir: Entity<InputState>,
-    region_index: usize,
-    hint: Option<SharedString>,
-}
-
-impl SettingsForm {
-    fn pick_output_dir(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let receiver = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: Some(SharedString::from("选择视频保存目录")),
-        });
-
-        cx.spawn_in(window, async move |this, cx| {
-            if let Ok(Ok(Some(paths))) = receiver.await
-                && let Some(first) = paths.into_iter().next()
-            {
-                this.update_in(cx, |this, window, cx| {
-                    let value = SharedString::from(first.to_string_lossy().to_string());
-                    this.output_dir.update(cx, |state, cx| {
-                        state.set_value(value, window, cx);
-                    });
-                    cx.notify();
-                })
-                .ok();
-            }
-        })
-        .detach();
-    }
-
-    fn save(&mut self, cx: &mut Context<Self>) {
-        let region_index = self.region_index;
-        let owner = self.owner.clone();
-
-        let outcome = owner
-            .update(cx, |this, cx| {
-                this.region_index = region_index;
-                let config = this.snapshot_config(cx);
-                let saved = config.save();
-                this.config = config;
-                cx.notify();
-                saved
-            })
-            .unwrap_or(Ok(()));
-
-        self.hint = Some(match outcome {
-            Ok(()) => SharedString::from("已保存"),
-            Err(error) => SharedString::from(format!("保存失败：{error}")),
-        });
-        cx.notify();
-    }
-}
-
-impl Render for SettingsForm {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = Palette::new(cx);
-        let region_options: Vec<(&'static str, &'static str)> = REGIONS.to_vec();
-        let region_index = self.region_index;
-        let file_path = Config::file_path().display().to_string();
-        let hint = self.hint.clone();
-
-        let mut body = v_flex()
-            .gap_3()
-            .w_full()
-            .child(field_row(
-                &p,
-                "API Key（作为 Authorization: Bearer … 发送）",
-                Input::new(&self.api_key).w_full().into_any_element(),
-            ))
-            .child(field_row(
-                &p,
-                "业务空间 ID（留空则回退经典 DashScope 域名）",
-                Input::new(&self.workspace_id).w_full().into_any_element(),
-            ))
-            .child(field_row(
-                &p,
-                "地域（必须与 API Key、模型同地域）",
-                options_row(
-                    "region",
-                    &region_options,
-                    REGIONS[region_index].1,
-                    cx,
-                    |this: &mut SettingsForm, value, _cx| {
-                        if let Some(index) = REGIONS.iter().position(|(_, v)| *v == value) {
-                            this.region_index = index;
-                        }
-                    },
-                ),
-            ))
-            .child(field_row(
-                &p,
-                "输出目录（生成完成后自动下载到这里）",
-                h_flex()
-                    .gap_2()
-                    .w_full()
-                    .child(Input::new(&self.output_dir).flex_1())
-                    .child(
-                        Button::new("pick-output-dir")
-                            .label("选择目录")
-                            .outline()
-                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                this.pick_output_dir(window, cx)
-                            })),
-                    )
-                    .into_any_element(),
-            ))
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(p.muted_fg)
-                    .child(SharedString::from(format!("配置文件：{file_path}"))),
-            );
-
-        if let Some(hint) = hint {
-            body = body.child(div().text_sm().text_color(p.primary).child(hint));
-        }
-
-        body.into_any_element()
-    }
-}
-
-// ------------------------------------------------------------------ 参考图列表
-
-/// 拖动参考图时跟随光标的预览。
-#[derive(Clone)]
-struct DraggedImage {
-    row: usize,
-    label: SharedString,
-}
-
-impl Render for DraggedImage {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .px_3()
-            .py_1()
-            .rounded(cx.theme().radius)
-            .bg(cx.theme().accent)
-            .text_color(cx.theme().accent_foreground)
-            .child(self.label.clone())
-    }
-}
-
-/// `List` 是虚拟化渲染，行数据由 delegate 自己持有；
-/// 顺序一旦变化就整份写回 `WanApp::images`（顺序即「图1」「图2」的引用顺序）。
-struct RefImagesDelegate {
-    owner: WeakEntity<WanApp>,
-    items: Vec<RefImage>,
-    selected: Option<IndexPath>,
-}
-
-/// 把第 `from` 项挪到第 `to` 位；越界或原地不动返回 false。
-fn reorder<T>(items: &mut Vec<T>, from: usize, to: usize) -> bool {
-    if from == to || from >= items.len() || to >= items.len() {
-        return false;
-    }
-    let item = items.remove(from);
-    items.insert(to, item);
-    true
-}
-
-impl RefImagesDelegate {
-    /// 把第 `from` 行插到第 `to` 行，返回是否真的移动了。
-    fn move_item(&mut self, from: usize, to: usize) -> bool {
-        reorder(&mut self.items, from, to)
-    }
-
-    fn remove_at(&mut self, row: usize) -> bool {
-        if row >= self.items.len() {
-            return false;
-        }
-        self.items.remove(row);
-        true
-    }
-
-    /// 整份写回主视图。只能在事件回调里调用：渲染期读主视图会和它自己的 `Render` 借冲突。
-    fn push_to_owner(&self, cx: &mut Context<ListState<Self>>) {
-        let Some(owner) = self.owner.upgrade() else {
-            return;
-        };
-        let items = self.items.clone();
-        owner.update(cx, |this, cx| {
-            this.images = items;
-            cx.notify();
-        });
-    }
-}
-
-impl ListDelegate for RefImagesDelegate {
-    type Item = ListItem;
-
-    fn items_count(&self, _section: usize, _cx: &App) -> usize {
-        self.items.len()
-    }
-
-    fn render_item(
-        &mut self,
-        ix: IndexPath,
-        _window: &mut Window,
-        cx: &mut Context<ListState<Self>>,
-    ) -> Option<Self::Item> {
-        let row = ix.row;
-        let image = self.items.get(row)?.clone();
-
-        let mut tile = h_flex().gap_3().items_center().w_full().py_1();
-        tile = match image.preview.clone() {
-            Some(path) => tile.child(
-                img(path)
-                    .w(px(72.))
-                    .h(px(54.))
-                    .rounded(cx.theme().radius)
-                    .object_fit(ObjectFit::Cover),
-            ),
-            None => tile.child(
-                v_flex()
-                    .w(px(72.))
-                    .h(px(54.))
-                    .items_center()
-                    .justify_center()
-                    .rounded(cx.theme().radius)
-                    .bg(cx.theme().muted)
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("URL"),
-                    ),
-            ),
-        };
-
-        // 虚拟化列表要求每行等高：信息固定压成两行并截断，保证行高由 54px 缩略图决定
-        let mut info = image.info.clone();
-        if let Some(note) = image.note.as_ref() {
-            info.push_str(" · ");
-            info.push_str(note);
-        }
-
-        let meta = v_flex()
-            .gap_1()
-            .flex_1()
-            .overflow_hidden()
-            .child(
-                div()
-                    .text_sm()
-                    .truncate()
-                    .child(SharedString::from(image.label.clone())),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .truncate()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(SharedString::from(info)),
-            );
-
-        tile = tile.child(meta).child(
-            Button::new(ElementId::Name(format!("remove-image:{row}").into()))
-                .label("移除")
-                .outline()
-                .on_click(cx.listener(move |state, _: &ClickEvent, _, cx| {
-                    let removed = state.delegate_mut().remove_at(row);
-                    if removed {
-                        state.delegate().push_to_owner(cx);
-                    }
-                    cx.notify();
-                })),
-        );
-
-        Some(
-            ListItem::new(ix)
-                .child(tile)
-                .selected(Some(ix) == self.selected)
-                .on_drag(
-                    DraggedImage {
-                        row,
-                        label: SharedString::from(image.label.clone()),
-                    },
-                    |drag, _, _, cx| cx.new(|_| drag.clone()),
-                )
-                .drag_over::<DraggedImage>(|style, _, _, cx| style.bg(cx.theme().drop_target))
-                .on_drop(cx.listener(move |state, drag: &DraggedImage, _, cx| {
-                    let moved = state.delegate_mut().move_item(drag.row, row);
-                    if moved {
-                        state.delegate().push_to_owner(cx);
-                    }
-                    cx.notify();
-                })),
-        )
-    }
-
-    fn set_selected_index(
-        &mut self,
-        ix: Option<IndexPath>,
-        _window: &mut Window,
-        cx: &mut Context<ListState<Self>>,
-    ) {
-        self.selected = ix;
-        cx.notify();
-    }
+/// 输出文件名带时间戳，避免同一秒内多次生成互相覆盖。
+fn output_path(output_dir: &str) -> PathBuf {
+    PathBuf::from(output_dir).join(format!(
+        "wan3-{}.mp4",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    ))
 }
 
 // ------------------------------------------------------------------ 主视图
@@ -497,17 +80,16 @@ pub struct WanApp {
     list_state: Entity<ListState<RefImagesDelegate>>,
 
     phase: Phase,
-    progress: f32,
     /// 待推送的通知，在下一帧统一交给窗口右上角的 Notification 组件
     notifications: Vec<Notification>,
     message: Option<SharedString>,
     result: Option<ResultInfo>,
 
-    /// 提示词防抖版本号，只有最后一次修改才会落盘
-    prompt_revision: u64,
+    /// 落盘防抖：参数与提示词各一份，互不干扰
+    config_saver: Debouncer,
+    prompt_saver: Debouncer,
     prompt_dirty: bool,
     prompt_status: Option<SharedString>,
-    config_revision: u64,
 
     _prompt_subscription: Subscription,
     _duration_subscription: Subscription,
@@ -517,39 +99,24 @@ impl WanApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let config = Config::load();
 
-        let api_key = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("sk-…")
-                .default_value(config.api_key.clone())
-        });
-        let workspace_id = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("业务空间 ID，留空则用 dashscope.aliyuncs.com")
-                .default_value(config.workspace_id.clone())
-        });
-        let output_dir =
-            cx.new(|cx| InputState::new(window, cx).default_value(config.output_dir.clone()));
+        let api_key = ui::text_input(window, cx, "sk-…", config.api_key.clone());
+        let workspace_id = ui::text_input(
+            window,
+            cx,
+            "业务空间 ID，留空则用 dashscope.aliyuncs.com",
+            config.workspace_id.clone(),
+        );
+        let output_dir = ui::text_input(window, cx, "视频保存目录", config.output_dir.clone());
+        let url_input = ui::text_input(window, cx, "粘贴 https:// 图片地址", "");
         let prompt = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .rows(5)
                 .placeholder("描述视频；可用「图1」「图2」指代上方的参考图")
                 .default_value(Config::load_prompt())
         });
-        let url_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("粘贴 https:// 图片地址"));
 
         let owner = cx.weak_entity();
-        let list_state = cx.new(|cx| {
-            ListState::new(
-                RefImagesDelegate {
-                    owner,
-                    items: Vec::new(),
-                    selected: None,
-                },
-                window,
-                cx,
-            )
-        });
+        let list_state = cx.new(|cx| ListState::new(RefImagesDelegate::new(owner), window, cx));
 
         let smart_duration = config.duration < 0;
         let duration_default = if smart_duration {
@@ -557,16 +124,16 @@ impl WanApp {
         } else {
             config.duration.clamp(MIN_DURATION, MAX_DURATION)
         };
-        let duration = cx.new(|cx| {
-            InputState::new(window, cx)
-                .min(MIN_DURATION as f64)
-                .max(MAX_DURATION as f64)
-                .default_value(duration_default.to_string())
-        });
+        let duration = ui::number_input(
+            window,
+            cx,
+            duration_default.to_string(),
+            MIN_DURATION as f64..=MAX_DURATION as f64,
+        );
 
         let prompt_subscription = cx.subscribe(&prompt, |this, _state, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
-                this.schedule_prompt_save(cx);
+                this.mark_prompt_dirty(cx);
             }
         });
         let duration_subscription =
@@ -606,26 +173,21 @@ impl WanApp {
             images: Vec::new(),
             list_state,
             phase: Phase::Idle,
-            progress: 0.0,
             notifications: Vec::new(),
             message: None,
             result: None,
-            prompt_revision: 0,
+            config_saver: Debouncer::default(),
+            prompt_saver: Debouncer::default(),
             prompt_dirty: false,
             prompt_status: None,
-            config_revision: 0,
             _prompt_subscription: prompt_subscription,
             _duration_subscription: duration_subscription,
         }
     }
 
-    fn busy(&self) -> bool {
-        matches!(
-            self.phase,
-            Phase::Submitting | Phase::Polling { .. } | Phase::Downloading { .. }
-        )
-    }
+    // ---------------------------------------------------------------- 配置快照
 
+    /// 时长输入框的当前值，非法输入回落到 5 秒。
     fn duration_seconds(&self, cx: &Context<Self>) -> i32 {
         self.duration
             .read(cx)
@@ -655,22 +217,24 @@ impl WanApp {
         config
     }
 
+    // ---------------------------------------------------------------- 提示出口
+
     /// 排队一条通知，下一帧由 `Render for WanApp` 推送到窗口右上角。
-    fn push_note(&mut self, note: Notification, cx: &mut Context<Self>) {
+    fn push_note(&mut self, cx: &mut Context<Self>, note: Notification) {
         self.notifications.push(note);
         cx.notify();
     }
 
     /// 过程信息，以 info 通知呈现。
-    fn log(&mut self, cx: &mut Context<Self>, message: impl Into<String>) {
-        self.push_note(Notification::info(message.into()), cx);
+    fn log(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        self.push_note(cx, Notification::info(message.into()));
     }
 
     /// 需要用户注意但不致命的问题，以 warning 通知呈现。
     fn warn(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
         let message = message.into();
         self.message = Some(SharedString::from(message.clone()));
-        self.push_note(Notification::warning(message), cx);
+        self.push_note(cx, Notification::warning(message));
     }
 
     /// 失败，以常驻的 error 通知呈现（需手动关闭）。
@@ -678,80 +242,67 @@ impl WanApp {
         let message = message.into();
         self.phase = Phase::Failed(SharedString::from(message.clone()));
         self.message = Some(SharedString::from(message.clone()));
-        self.progress = 0.0;
-        self.push_note(Notification::error(message).autohide(false), cx);
+        self.push_note(cx, Notification::error(message).autohide(false));
     }
 
     // ---------------------------------------------------------------- 持久化
 
-    /// 生成参数一旦修改就落盘；用版本号做防抖，连续点击只写最后一次。
+    /// 生成参数一改就落盘；连续点击只写最后一次。
     fn mark_config_dirty(&mut self, delay: Duration, cx: &mut Context<Self>) {
-        self.config_revision = self.config_revision.wrapping_add(1);
-        let revision = self.config_revision;
+        let revision = self.config_saver.bump();
         let config = self.snapshot_config(cx);
         self.config = config.clone();
 
         cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(delay).await;
-            let is_latest = this
-                .update(cx, |this, _| this.config_revision == revision)
-                .unwrap_or(false);
-            if !is_latest {
-                return;
-            }
+            let outcome = write_after_debounce(
+                &this,
+                cx,
+                delay,
+                |app| app.config_saver.is_current(revision),
+                move || config.save(),
+            )
+            .await;
 
-            let saved = cx
-                .background_executor()
-                .spawn(async move { config.save() })
-                .await;
-            if let Err(error) = saved {
-                this.update(cx, |this, cx| {
-                    this.log(cx, format!("参数保存失败：{error:#}"));
-                    cx.notify();
-                })
-                .ok();
+            if let Some(Err(error)) = outcome {
+                update_view(&this, cx, |app, cx| {
+                    app.log(format!("参数保存失败：{error:#}"), cx)
+                });
             }
         })
         .detach();
     }
 
     /// 提示词停止输入 3 秒后写入 prompt.txt。
-    fn schedule_prompt_save(&mut self, cx: &mut Context<Self>) {
-        self.prompt_revision = self.prompt_revision.wrapping_add(1);
+    fn mark_prompt_dirty(&mut self, cx: &mut Context<Self>) {
+        let revision = self.prompt_saver.bump();
+        let text = self.prompt.read(cx).value().to_string();
         self.prompt_dirty = true;
         self.prompt_status = Some(SharedString::from("待保存…"));
-        let revision = self.prompt_revision;
-        let text = self.prompt.read(cx).value().to_string();
         cx.notify();
 
         cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(PROMPT_SAVE_DELAY).await;
-            let is_latest = this
-                .update(cx, |this, _| this.prompt_revision == revision)
-                .unwrap_or(false);
-            if !is_latest {
+            let outcome = write_after_debounce(
+                &this,
+                cx,
+                PROMPT_SAVE_DELAY,
+                |app| app.prompt_saver.is_current(revision),
+                move || Config::save_prompt(&text),
+            )
+            .await;
+
+            let Some(outcome) = outcome else {
                 return;
-            }
-
-            let saved = cx
-                .background_executor()
-                .spawn(async move { Config::save_prompt(&text) })
-                .await;
-
-            this.update(cx, |this, cx| {
-                this.prompt_dirty = false;
-                match saved {
-                    Ok(()) => {
-                        this.prompt_status = Some(SharedString::from("已保存"));
-                    }
+            };
+            update_view(&this, cx, |app, cx| {
+                app.prompt_dirty = false;
+                app.prompt_status = Some(match &outcome {
+                    Ok(()) => SharedString::from("已保存"),
                     Err(error) => {
-                        this.prompt_status = Some(SharedString::from(format!("保存失败：{error}")));
-                        this.log(cx, format!("提示词保存失败：{error:#}"));
+                        app.log(format!("提示词保存失败：{error:#}"), cx);
+                        SharedString::from(format!("保存失败：{error}"))
                     }
-                }
-                cx.notify();
-            })
-            .ok();
+                });
+            });
         })
         .detach();
     }
@@ -764,13 +315,8 @@ impl WanApp {
         let workspace_id = self.workspace_id.clone();
         let output_dir = self.output_dir.clone();
         let region_index = self.region_index;
-        let form = cx.new(move |_| SettingsForm {
-            owner,
-            api_key,
-            workspace_id,
-            output_dir,
-            region_index,
-            hint: None,
+        let form = cx.new(move |_| {
+            SettingsForm::new(owner, api_key, workspace_id, output_dir, region_index)
         });
 
         let footer_form = form.clone();
@@ -831,46 +377,35 @@ impl WanApp {
             return;
         }
 
-        let room = media::MAX_IMAGES.saturating_sub(self.images.len());
+        let room = self.image_room(cx);
         if room == 0 {
-            self.warn("参考图最多 10 张", cx);
             return;
         }
         if files.len() > room {
-            self.log(cx, format!("最多再添加 {room} 张，已忽略多余的图片"));
+            self.log(format!("最多再添加 {room} 张，已忽略多余的图片"), cx);
             files.truncate(room);
         }
 
-        self.log(cx, format!("正在处理 {} 张图片…", files.len()));
-        let task = cx.background_executor().spawn(async move {
+        self.log(format!("正在处理 {} 张图片…", files.len()), cx);
+        let decode = cx.background_executor().spawn(async move {
             files
                 .into_iter()
                 .map(|path| {
-                    let result = media::prepare_local(&path);
-                    (path, result)
+                    let prepared = media::prepare_local(&path);
+                    (path, prepared)
                 })
                 .collect::<Vec<_>>()
         });
 
         cx.spawn(async move |this, cx| {
-            let results = task.await;
+            let decoded = decode.await;
             this.update(cx, |this, cx| {
-                for (path, result) in results {
+                for (path, result) in decoded {
                     match result {
-                        Ok(image) => {
-                            this.log(
-                                cx,
-                                format!("已添加参考图 {}（{}）", image.label, image.info),
-                            );
-                            this.images.push(image);
-                        }
-                        Err(error) => {
-                            this.warn(format!("{}：{error:#}", path.display()), cx);
-                        }
+                        Ok(image) => this.append_image(image, cx),
+                        Err(error) => this.warn(format!("{}：{error:#}", path.display()), cx),
                     }
                 }
-                this.sync_image_list(cx);
-                cx.notify();
             })
             .ok();
         })
@@ -878,23 +413,43 @@ impl WanApp {
     }
 
     fn add_remote_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.images.len() >= media::MAX_IMAGES {
-            self.warn("参考图最多 10 张", cx);
+        if self.image_room(cx) == 0 {
             return;
         }
+
         let url = self.url_input.read(cx).value().trim().to_string();
         match media::prepare_remote(&url) {
             Ok(image) => {
-                self.log(cx, format!("已添加远程参考图 {}", image.label));
-                self.images.push(image);
+                self.append_image(image, cx);
                 self.url_input.update(cx, |state, cx| {
                     state.set_value(SharedString::from(""), window, cx);
                 });
-                self.sync_image_list(cx);
                 cx.notify();
             }
             Err(error) => self.warn(format!("{error:#}"), cx),
         }
+    }
+
+    /// 剩余可添加的参考图数量（上限 10 张）；已经满了会提示一次并返回 0。
+    fn image_room(&mut self, cx: &mut Context<Self>) -> usize {
+        let room = media::MAX_IMAGES.saturating_sub(self.images.len());
+        if room == 0 {
+            self.warn("参考图最多 10 张", cx);
+        }
+        room
+    }
+
+    /// 追加一张参考图：记日志、刷新列表、重绘。
+    ///
+    /// 改 `self.images` 的唯一入口，保证列表与主视图不会走散。
+    fn append_image(&mut self, image: RefImage, cx: &mut Context<Self>) {
+        self.log(
+            format!("已添加参考图 {}（{}）", image.label, image.info),
+            cx,
+        );
+        self.images.push(image);
+        self.sync_image_list(cx);
+        cx.notify();
     }
 
     /// 把 `self.images` 整份灌进参考图列表。
@@ -904,15 +459,99 @@ impl WanApp {
     fn sync_image_list(&mut self, cx: &mut Context<Self>) {
         let items = self.images.clone();
         self.list_state.update(cx, |state, cx| {
-            state.delegate_mut().items = items;
+            state.delegate_mut().reset(items);
             cx.notify();
         });
     }
 
+    /// 参考图列表增删/重排后的回写入口。
+    pub(crate) fn apply_images(&mut self, images: Vec<RefImage>, cx: &mut Context<Self>) {
+        self.images = images;
+        cx.notify();
+    }
+
+    /// 连接设置弹窗的落盘入口：写回地域并整体保存一次。
+    pub(crate) fn apply_connection_settings(
+        &mut self,
+        region_index: usize,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        self.region_index = region_index;
+        let config = self.snapshot_config(cx);
+        let saved = config.save();
+        self.config = config;
+        cx.notify();
+        saved
+    }
+
     // ---------------------------------------------------------------- 生成流程
 
+    /// 生成完成，切入下载阶段。
+    fn begin_download(&mut self, elapsed: Duration, usage: Option<&Usage>, cx: &mut Context<Self>) {
+        self.phase = Phase::Downloading {
+            received: 0,
+            total: 0,
+        };
+        self.log(
+            format!(
+                "生成完成（耗时 {}），开始下载…",
+                task::format_elapsed(elapsed)
+            ),
+            cx,
+        );
+        if let Some(usage) = usage {
+            self.log(format!("用量：{}", usage.describe()), cx);
+        }
+    }
+
+    /// 下载结束。
+    ///
+    /// 下载失败不算流程失败：视频已经生成，链接 24 小时内还能救回来。
+    fn finish_download(
+        &mut self,
+        video_url: String,
+        destination: PathBuf,
+        usage: Option<Usage>,
+        downloaded: Result<u64, String>,
+        elapsed: Duration,
+        cx: &mut Context<Self>,
+    ) {
+        let saved = match downloaded {
+            Ok(bytes) => {
+                self.log(
+                    format!(
+                        "已保存 {}（{}）",
+                        destination.display(),
+                        media::human_size(bytes)
+                    ),
+                    cx,
+                );
+                self.message = Some(SharedString::from(format!(
+                    "已保存到 {}",
+                    destination.display()
+                )));
+                Some(destination)
+            }
+            Err(error) => {
+                self.warn(
+                    format!("视频已生成但下载失败：{error}。链接 24 小时内有效，请尽快手动下载"),
+                    cx,
+                );
+                None
+            }
+        };
+
+        self.phase = Phase::Done;
+        self.result = Some(ResultInfo {
+            video_url,
+            saved,
+            usage,
+            elapsed,
+        });
+    }
+
     fn start_generation(&mut self, cx: &mut Context<Self>) {
-        if self.busy() {
+        if self.phase.is_busy() {
             return;
         }
 
@@ -939,7 +578,7 @@ impl WanApp {
         }
 
         if let Err(error) = config.save() {
-            self.log(cx, format!("配置保存失败：{error}"));
+            self.log(format!("配置保存失败：{error}"), cx);
         }
 
         let request = CreateRequest {
@@ -966,9 +605,7 @@ impl WanApp {
         self.result = None;
         self.message = None;
         self.phase = Phase::Submitting;
-        self.progress = 0.0;
         self.log(
-            cx,
             format!(
                 "提交任务 model={} resolution={} ratio={} duration={} audio={} 参考图={}张",
                 config.model,
@@ -982,6 +619,7 @@ impl WanApp {
                 config.audio,
                 self.images.len()
             ),
+            cx,
         );
 
         let started = Instant::now();
@@ -989,192 +627,75 @@ impl WanApp {
 
         cx.spawn(async move |this, cx| {
             let request_config = create_config.clone();
-            let created = cx
-                .background_executor()
-                .spawn(async move { api::create_task(&request_config, &request) })
-                .await;
+            let created = offload(cx, move || api::create_task(&request_config, &request)).await;
 
             let task_id = match created {
                 Ok(task_id) => task_id,
                 Err(error) => {
-                    this.update(cx, |this, cx| this.fail(format!("{error:#}"), cx))
-                        .ok();
+                    update_view(&this, cx, |app, cx| app.fail(format!("{error:#}"), cx));
                     return;
                 }
             };
 
-            this.update(cx, |this, cx| {
-                this.phase = Phase::Polling {
+            update_view(&this, cx, |app, cx| {
+                app.phase = Phase::Polling {
                     status: SharedString::from("PENDING"),
                     polls: 0,
                 };
-                this.log(cx, format!("任务已创建：{task_id}"));
-                cx.notify();
-            })
-            .ok();
+                app.log(format!("任务已创建：{task_id}"), cx);
+            });
 
-            for poll in 1..=api::MAX_POLLS {
-                cx.background_executor()
-                    .timer(Duration::from_secs(api::POLL_SECS))
-                    .await;
-
-                let query_config = create_config.clone();
-                let query_id = task_id.clone();
-                let outcome = cx
-                    .background_executor()
-                    .spawn(async move { api::query_task(&query_config, &query_id) })
-                    .await;
-
-                let is_running = matches!(outcome, Ok(TaskOutcome::Running));
-
-                match outcome {
-                    Ok(TaskOutcome::Pending) | Ok(TaskOutcome::Running) => {
-                        let status = if is_running { "RUNNING" } else { "PENDING" };
-                        let elapsed = started.elapsed().as_secs();
-                        this.update(cx, |this, cx| {
-                            this.phase = Phase::Polling {
-                                status: SharedString::from(status),
-                                polls: poll,
-                            };
-                            if poll % 4 == 0 {
-                                this.log(cx, format!("{status} · 已等待 {elapsed} 秒"));
-                            }
-                            cx.notify();
-                        })
-                        .ok();
-                    }
-                    Ok(TaskOutcome::Succeeded { video_url, usage }) => {
-                        let elapsed = format!("{:.0}s", started.elapsed().as_secs_f64());
-                        let file_name = format!(
-                            "wan3-{}.mp4",
-                            chrono::Local::now().format("%Y%m%d-%H%M%S")
+            let outcome = poll_until_done(cx, &create_config, &task_id, |cx, status, poll| {
+                update_view(&this, cx, |app, cx| {
+                    app.phase = Phase::Polling {
+                        status: SharedString::from(status),
+                        polls: poll,
+                    };
+                    // 每 4 次（约 1 分钟）报一次心跳，避免刷屏
+                    if poll % POLL_LOG_EVERY == 0 {
+                        app.log(
+                            format!(
+                                "{status} · 已等待 {}",
+                                task::format_elapsed(started.elapsed())
+                            ),
+                            cx,
                         );
-                        let destination = PathBuf::from(&create_config.output_dir).join(file_name);
-
-                        this.update(cx, |this, cx| {
-                            this.phase = Phase::Downloading {
-                                received: 0,
-                                total: 0,
-                            };
-                            this.log(cx, format!("生成完成（耗时 {elapsed}），开始下载…"));
-                            if let Some(usage) = usage.as_ref() {
-                                this.log(cx, format!("用量：{}", usage.describe()));
-                            }
-                            cx.notify();
-                        })
-                        .ok();
-
-                        let received = Arc::new(AtomicU64::new(0));
-                        let total = Arc::new(AtomicU64::new(0));
-                        let outcome_store: Arc<Mutex<Option<Result<u64, String>>>> =
-                            Arc::new(Mutex::new(None));
-
-                        {
-                            let url = video_url.clone();
-                            let path = destination.clone();
-                            let received = received.clone();
-                            let total = total.clone();
-                            let store = outcome_store.clone();
-                            cx.background_executor()
-                                .spawn(async move {
-                                    let result = api::download_video(&url, &path, &received, &total)
-                                        .map_err(|error| format!("{error:#}"));
-                                    if let Ok(mut slot) = store.lock() {
-                                        *slot = Some(result);
-                                    }
-                                })
-                                .detach();
-                        }
-
-                        loop {
-                            cx.background_executor()
-                                .timer(Duration::from_millis(500))
-                                .await;
-                            let received_now = received.load(Ordering::Relaxed);
-                            let total_now = total.load(Ordering::Relaxed);
-                            this.update(cx, |this, cx| {
-                                this.phase = Phase::Downloading {
-                                    received: received_now,
-                                    total: total_now,
-                                };
-                                cx.notify();
-                            })
-                            .ok();
-                            let finished = outcome_store
-                                .lock()
-                                .map(|slot| slot.is_some())
-                                .unwrap_or(false);
-                            if finished {
-                                break;
-                            }
-                        }
-
-                        let downloaded =
-                            outcome_store.lock().ok().and_then(|mut slot| slot.take());
-                        match downloaded {
-                            Some(Ok(bytes)) => {
-                                let saved = destination.clone();
-                                this.update(cx, |this, cx| {
-                                    this.phase = Phase::Done;
-                                    this.progress = 100.0;
-                                    this.message = Some(SharedString::from(format!(
-                                        "已保存到 {}",
-                                        saved.display()
-                                    )));
-                                    this.log(cx, format!(
-                                        "已保存 {}（{}）",
-                                        saved.display(),
-                                        media::human_size(bytes)
-                                    ));
-                                    this.result = Some(ResultInfo {
-                                        video_url: video_url.clone(),
-                                        saved: Some(saved),
-                                        usage: usage.clone(),
-                                        elapsed: elapsed.clone(),
-                                    });
-                                    cx.notify();
-                                })
-                                .ok();
-                            }
-                            Some(Err(error)) => {
-                                this.update(cx, |this, cx| {
-                                    this.warn(
-                                        format!("视频已生成但下载失败：{error}。链接 24 小时内有效，请尽快手动下载"),
-                                        cx,
-                                    );
-                                    this.phase = Phase::Done;
-                                    this.result = Some(ResultInfo {
-                                        video_url: video_url.clone(),
-                                        saved: None,
-                                        usage: usage.clone(),
-                                        elapsed: elapsed.clone(),
-                                    });
-                                })
-                                .ok();
-                            }
-                            None => {}
-                        }
-                        return;
                     }
-                    Ok(TaskOutcome::Failed { code, message }) => {
-                        this.update(cx, |this, cx| {
-                            this.fail(format!("任务失败：{code} {message}"), cx)
-                        })
-                        .ok();
-                        return;
-                    }
-                    Err(error) => {
-                        this.update(cx, |this, cx| this.fail(format!("{error:#}"), cx))
-                            .ok();
-                        return;
-                    }
-                }
-            }
-
-            this.update(cx, |this, cx| {
-                this.fail("任务超时：超过 40 分钟仍未完成，请改用查询接口或稍后重试", cx)
+                });
             })
-            .ok();
+            .await;
+
+            match outcome {
+                Ok(PollOutcome::Succeeded { video_url, usage }) => {
+                    let elapsed = started.elapsed();
+                    let destination = output_path(&create_config.output_dir);
+                    update_view(&this, cx, |app, cx| {
+                        app.begin_download(elapsed, usage.as_ref(), cx)
+                    });
+
+                    let downloaded = download_with_progress(
+                        cx,
+                        &video_url,
+                        &destination,
+                        |cx, received, total| {
+                            update_view(&this, cx, |app, _| {
+                                app.phase = Phase::Downloading { received, total };
+                            });
+                        },
+                    )
+                    .await;
+
+                    update_view(&this, cx, |app, cx| {
+                        app.finish_download(video_url, destination, usage, downloaded, elapsed, cx)
+                    });
+                }
+                Ok(PollOutcome::Failed { code, message }) => {
+                    update_view(&this, cx, |app, cx| {
+                        app.fail(format!("任务失败：{code} {message}"), cx)
+                    });
+                }
+                Err(error) => update_view(&this, cx, |app, cx| app.fail(error, cx)),
+            }
         })
         .detach();
     }
@@ -1205,23 +726,13 @@ impl WanApp {
                 v_flex()
                     .gap_1()
                     .child(div().text_lg().child("万相 3.0 视频生成"))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(p.muted_fg)
-                            .child("全能参考：参考图 + 提示词 → 视频"),
-                    ),
+                    .child(ui::hint(p, "全能参考：参考图 + 提示词 → 视频")),
             )
             .child(
                 h_flex()
                     .gap_3()
                     .items_center()
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(p.muted_fg)
-                            .child(self.endpoint_summary(cx)),
-                    )
+                    .child(ui::hint(p, self.endpoint_summary(cx)))
                     .child(
                         Button::new("open-settings")
                             .label("连接设置")
@@ -1243,24 +754,20 @@ impl WanApp {
             .gap_2()
             .w_full()
             .child(Textarea::new(&self.prompt).w_full())
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(p.muted_fg)
-                    .child("最多 20000 字符；用「图1」「图2」指代参考图的排列顺序。"),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(p.muted_fg)
-                    .child(SharedString::from(format!(
-                        "提示词修改后 3 秒自动保存到 {} · {status}",
-                        Config::prompt_file_path().display()
-                    ))),
-            )
+            .child(ui::hint(
+                p,
+                "最多 20000 字符；用「图1」「图2」指代参考图的排列顺序。",
+            ))
+            .child(ui::hint(
+                p,
+                format!(
+                    "提示词修改后 3 秒自动保存到 {} · {status}",
+                    Config::prompt_file_path().display()
+                ),
+            ))
             .into_any_element();
 
-        section(p, "提示词 prompt", None, body)
+        ui::section(p, "提示词 prompt", None, body)
     }
 
     fn render_images(&mut self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
@@ -1268,14 +775,13 @@ impl WanApp {
 
         // 列表为空时换成一行提示，避免 0 高度的虚拟列表
         let list: AnyElement = if count == 0 {
-            div()
-                .text_sm()
-                .text_color(p.muted_fg)
-                .child("还没有参考图：点击「选择本地图片」，或把图片直接拖进窗口，也可以粘贴公网图片地址。")
-                .into_any_element()
+            ui::hint(
+                p,
+                "还没有参考图：点击「选择本地图片」，或把图片直接拖进窗口，也可以粘贴公网图片地址。",
+            )
         } else {
             List::new(&self.list_state)
-                .max_h(px(300.))
+                .max_h(px(ui::IMAGE_LIST_MAX_HEIGHT))
                 .into_any_element()
         };
 
@@ -1318,7 +824,7 @@ impl WanApp {
                     .text_sm()
                     .text_color(p.muted_fg)
                     .child(SharedString::from(format!(
-                        "已选 {count}/{} 张 · 按住某一行拖动可调整顺序（顺序即「图1」「图2」的引用顺序）· 本地图片自动转 Base64 上传（单张 ≤ 20MB，超限会自动压缩）",
+                        "已选 {count}/{} 张 · 按住某一行拖动可调整顺序 · 本地图片自动转 Base64 上传（单张 ≤ 20MB，超限会自动压缩）",
                         media::MAX_IMAGES
                     ))),
             )
@@ -1330,7 +836,7 @@ impl WanApp {
             }))
             .into_any_element();
 
-        section(p, "参考图 reference_image", Some("最多 10 张参考图"), body)
+        ui::section(p, "参考图 reference_image", Some("最多 10 张参考图"), body)
     }
 
     fn render_params(&mut self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
@@ -1343,10 +849,10 @@ impl WanApp {
         let body = v_flex()
             .gap_4()
             .w_full()
-            .child(field_row(
+            .child(ui::field_row(
                 p,
                 "清晰度 resolution",
-                options_row(
+                ui::segmented(
                     "resolution",
                     &resolution_options,
                     RESOLUTIONS[self.resolution_index],
@@ -1359,10 +865,10 @@ impl WanApp {
                     },
                 ),
             ))
-            .child(field_row(
+            .child(ui::field_row(
                 p,
                 "比例 ratio",
-                options_row(
+                ui::segmented(
                     "ratio",
                     &ratio_options,
                     RATIOS[self.ratio_index],
@@ -1375,10 +881,10 @@ impl WanApp {
                     },
                 ),
             ))
-            .child(field_row(
+            .child(ui::field_row(
                 p,
                 "模型 model",
-                options_row(
+                ui::segmented(
                     "model",
                     &model_options,
                     MODELS[self.model_index].1,
@@ -1396,7 +902,7 @@ impl WanApp {
                     .gap_6()
                     .items_start()
                     .w_full()
-                    .child(field_row(
+                    .child(ui::field_row(
                         p,
                         "时长 duration（2~30 秒）",
                         h_flex()
@@ -1418,7 +924,7 @@ impl WanApp {
                             )
                             .into_any_element(),
                     ))
-                    .child(field_row(
+                    .child(ui::field_row(
                         p,
                         "声音 audio",
                         Switch::new("audio-switch")
@@ -1433,7 +939,7 @@ impl WanApp {
             )
             .into_any_element();
 
-        section(
+        ui::section(
             p,
             "生成参数 parameters",
             Some(
@@ -1450,7 +956,7 @@ impl WanApp {
 
         let video_url = result.video_url.clone();
         let saved = result.saved.clone();
-        let elapsed = result.elapsed.clone();
+        let elapsed = task::format_elapsed(result.elapsed);
         let usage_text = result.usage.as_ref().map(|usage| usage.describe());
 
         let saved_text = match saved.as_ref() {
@@ -1520,47 +1026,23 @@ impl WanApp {
 
         body = body.child(actions);
 
-        section(p, "生成结果", None, body.into_any_element())
+        ui::section(p, "生成结果", None, body.into_any_element())
     }
 
     fn render_footer(&mut self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
-        let busy = self.busy();
-        let (label, color) = match &self.phase {
-            Phase::Idle => ("待命", p.muted_fg),
-            Phase::Submitting => ("提交任务中", p.primary),
-            Phase::Polling { .. } => ("生成中", p.primary),
-            Phase::Downloading { .. } => ("下载中", p.primary),
-            Phase::Done => ("已完成", p.primary),
-            Phase::Failed(_) => ("失败", p.danger),
+        let busy = self.phase.is_busy();
+        let color = match self.phase.kind() {
+            PhaseKind::Idle => p.muted_fg,
+            PhaseKind::Busy | PhaseKind::Done => p.primary,
+            PhaseKind::Failed => p.danger,
         };
-
-        let detail = match &self.phase {
-            Phase::Polling { status, polls } if *polls == 0 => {
-                format!("{status} · 等待首次查询（每 15 秒轮询一次）")
-            }
-            Phase::Polling { status, polls } => {
-                format!("{status} · 第 {polls} 次轮询（每 15 秒一次）")
-            }
-            Phase::Downloading { received, total } if *total > 0 => format!(
-                "{} / {}",
-                media::human_size(*received),
-                media::human_size(*total)
-            ),
-            Phase::Downloading { received, .. } => media::human_size(*received),
-            Phase::Failed(message) => message.to_string(),
-            _ => self
-                .message
-                .as_ref()
-                .map(|message| message.to_string())
-                .unwrap_or_default(),
-        };
-
-        let progress_value = match &self.phase {
-            Phase::Downloading { received, total } if *total > 0 => {
-                (*received as f32 / *total as f32) * 100.0
-            }
-            _ => self.progress,
-        };
+        // 阶段自己说不清的时候，回落到最近一条提示
+        let detail = self
+            .phase
+            .detail()
+            .or_else(|| self.message.as_ref().map(|message| message.to_string()))
+            .unwrap_or_default();
+        let progress = self.phase.progress();
 
         v_flex()
             .w_full()
@@ -1589,8 +1071,8 @@ impl WanApp {
                     Progress::new("run-progress")
                         .xsmall()
                         .rounded(px(0.))
-                        .value(progress_value)
-                        .loading(matches!(self.phase, Phase::Polling { .. })),
+                        .value(progress.unwrap_or(0.))
+                        .loading(progress.is_none()),
                 )
             })
             .child(
@@ -1598,7 +1080,13 @@ impl WanApp {
                     h_flex()
                         .gap_3()
                         .min_w(px(0.0))
-                        .child(div().text_sm().font_bold().text_color(color).child(label))
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_bold()
+                                .text_color(color)
+                                .child(self.phase.label()),
+                        )
                         .child(
                             div()
                                 .text_sm()
@@ -1637,7 +1125,7 @@ impl Render for WanApp {
             }
         }
 
-        let p = Palette::new(cx);
+        let p = ui::Palette::new(cx);
 
         let header = self.render_header(&p, cx);
         let params = self.render_params(&p, cx);
@@ -1667,40 +1155,3 @@ impl Render for WanApp {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::reorder;
-
-    /// 拖动重排直接决定「图1」「图2」的引用顺序，必须准确。
-    #[test]
-    fn reorder_moves_item_to_target_position() {
-        let mut items = vec!["A", "B", "C"];
-
-        // A 拖到第 3 行（末尾）
-        assert!(reorder(&mut items, 0, 2));
-        assert_eq!(items, ["B", "C", "A"]);
-
-        // A 再拖回第一行
-        assert!(reorder(&mut items, 2, 0));
-        assert_eq!(items, ["A", "B", "C"]);
-
-        // 中间插入
-        assert!(reorder(&mut items, 0, 1));
-        assert_eq!(items, ["B", "A", "C"]);
-    }
-
-    #[test]
-    fn reorder_rejects_noop_and_out_of_range() {
-        let mut items = vec!["A", "B", "C"];
-
-        assert!(!reorder(&mut items, 1, 1));
-        assert_eq!(items, ["A", "B", "C"]);
-
-        assert!(!reorder(&mut items, 0, 3));
-        assert!(!reorder(&mut items, 3, 0));
-        assert_eq!(items, ["A", "B", "C"]);
-
-        let mut empty: Vec<&str> = Vec::new();
-        assert!(!reorder(&mut empty, 0, 0));
-    }
-}
