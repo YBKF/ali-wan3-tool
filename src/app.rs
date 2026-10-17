@@ -15,12 +15,13 @@ use gpui_kit::base::StyledExt;
 use gpui_kit::component::Sizable;
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, WindowExt as _,
+    ActiveTheme as _, Disableable as _, IndexPath, WindowExt as _,
     button::{Button, ButtonVariants as _},
     dialog::DialogFooter,
     h_flex,
     input::{Input, InputEvent, InputState, NumberInput, Textarea, TextareaState},
     label::Label,
+    list::{List, ListDelegate, ListItem, ListState},
     notification::Notification,
     progress::Progress,
     switch::Switch,
@@ -47,11 +48,9 @@ struct Palette {
     bg: Hsla,
     fg: Hsla,
     primary: Hsla,
-    muted: Hsla,
     muted_fg: Hsla,
     border: Hsla,
     danger: Hsla,
-    radius: Pixels,
     radius_lg: Pixels,
 }
 
@@ -62,11 +61,9 @@ impl Palette {
             bg: theme.background,
             fg: theme.foreground,
             primary: theme.primary,
-            muted: theme.muted,
             muted_fg: theme.muted_foreground,
             border: theme.border,
             danger: theme.danger,
-            radius: theme.radius,
             radius_lg: theme.radius_lg,
         }
     }
@@ -296,6 +293,185 @@ impl Render for SettingsForm {
     }
 }
 
+// ------------------------------------------------------------------ 参考图列表
+
+/// 拖动参考图时跟随光标的预览。
+#[derive(Clone)]
+struct DraggedImage {
+    row: usize,
+    label: SharedString,
+}
+
+impl Render for DraggedImage {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_3()
+            .py_1()
+            .rounded(cx.theme().radius)
+            .bg(cx.theme().accent)
+            .text_color(cx.theme().accent_foreground)
+            .child(self.label.clone())
+    }
+}
+
+/// `List` 是虚拟化渲染，行数据由 delegate 自己持有；
+/// 顺序一旦变化就整份写回 `WanApp::images`（顺序即「图1」「图2」的引用顺序）。
+struct RefImagesDelegate {
+    owner: WeakEntity<WanApp>,
+    items: Vec<RefImage>,
+    selected: Option<IndexPath>,
+}
+
+/// 把第 `from` 项挪到第 `to` 位；越界或原地不动返回 false。
+fn reorder<T>(items: &mut Vec<T>, from: usize, to: usize) -> bool {
+    if from == to || from >= items.len() || to >= items.len() {
+        return false;
+    }
+    let item = items.remove(from);
+    items.insert(to, item);
+    true
+}
+
+impl RefImagesDelegate {
+    /// 把第 `from` 行插到第 `to` 行，返回是否真的移动了。
+    fn move_item(&mut self, from: usize, to: usize) -> bool {
+        reorder(&mut self.items, from, to)
+    }
+
+    fn remove_at(&mut self, row: usize) -> bool {
+        if row >= self.items.len() {
+            return false;
+        }
+        self.items.remove(row);
+        true
+    }
+
+    /// 整份写回主视图。只能在事件回调里调用：渲染期读主视图会和它自己的 `Render` 借冲突。
+    fn push_to_owner(&self, cx: &mut Context<ListState<Self>>) {
+        let Some(owner) = self.owner.upgrade() else {
+            return;
+        };
+        let items = self.items.clone();
+        owner.update(cx, |this, cx| {
+            this.images = items;
+            cx.notify();
+        });
+    }
+}
+
+impl ListDelegate for RefImagesDelegate {
+    type Item = ListItem;
+
+    fn items_count(&self, _section: usize, _cx: &App) -> usize {
+        self.items.len()
+    }
+
+    fn render_item(
+        &mut self,
+        ix: IndexPath,
+        _window: &mut Window,
+        cx: &mut Context<ListState<Self>>,
+    ) -> Option<Self::Item> {
+        let row = ix.row;
+        let image = self.items.get(row)?.clone();
+
+        let mut tile = h_flex().gap_3().items_center().w_full().py_1();
+        tile = match image.preview.clone() {
+            Some(path) => tile.child(
+                img(path)
+                    .w(px(72.))
+                    .h(px(54.))
+                    .rounded(cx.theme().radius)
+                    .object_fit(ObjectFit::Cover),
+            ),
+            None => tile.child(
+                v_flex()
+                    .w(px(72.))
+                    .h(px(54.))
+                    .items_center()
+                    .justify_center()
+                    .rounded(cx.theme().radius)
+                    .bg(cx.theme().muted)
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("URL"),
+                    ),
+            ),
+        };
+
+        // 虚拟化列表要求每行等高：信息固定压成两行并截断，保证行高由 54px 缩略图决定
+        let mut info = image.info.clone();
+        if let Some(note) = image.note.as_ref() {
+            info.push_str(" · ");
+            info.push_str(note);
+        }
+
+        let meta = v_flex()
+            .gap_1()
+            .flex_1()
+            .overflow_hidden()
+            .child(
+                div()
+                    .text_sm()
+                    .truncate()
+                    .child(SharedString::from(image.label.clone())),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .truncate()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(SharedString::from(info)),
+            );
+
+        tile = tile.child(meta).child(
+            Button::new(ElementId::Name(format!("remove-image:{row}").into()))
+                .label("移除")
+                .outline()
+                .on_click(cx.listener(move |state, _: &ClickEvent, _, cx| {
+                    let removed = state.delegate_mut().remove_at(row);
+                    if removed {
+                        state.delegate().push_to_owner(cx);
+                    }
+                    cx.notify();
+                })),
+        );
+
+        Some(
+            ListItem::new(ix)
+                .child(tile)
+                .selected(Some(ix) == self.selected)
+                .on_drag(
+                    DraggedImage {
+                        row,
+                        label: SharedString::from(image.label.clone()),
+                    },
+                    |drag, _, _, cx| cx.new(|_| drag.clone()),
+                )
+                .drag_over::<DraggedImage>(|style, _, _, cx| style.bg(cx.theme().drop_target))
+                .on_drop(cx.listener(move |state, drag: &DraggedImage, _, cx| {
+                    let moved = state.delegate_mut().move_item(drag.row, row);
+                    if moved {
+                        state.delegate().push_to_owner(cx);
+                    }
+                    cx.notify();
+                })),
+        )
+    }
+
+    fn set_selected_index(
+        &mut self,
+        ix: Option<IndexPath>,
+        _window: &mut Window,
+        cx: &mut Context<ListState<Self>>,
+    ) {
+        self.selected = ix;
+        cx.notify();
+    }
+}
+
 // ------------------------------------------------------------------ 主视图
 
 pub struct WanApp {
@@ -317,6 +493,8 @@ pub struct WanApp {
     audio: bool,
 
     images: Vec<RefImage>,
+    /// 参考图列表（虚拟化 + 拖拽重排）；顺序即「图1」「图2」的引用顺序
+    list_state: Entity<ListState<RefImagesDelegate>>,
 
     phase: Phase,
     progress: f32,
@@ -359,6 +537,19 @@ impl WanApp {
         });
         let url_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("粘贴 https:// 图片地址"));
+
+        let owner = cx.weak_entity();
+        let list_state = cx.new(|cx| {
+            ListState::new(
+                RefImagesDelegate {
+                    owner,
+                    items: Vec::new(),
+                    selected: None,
+                },
+                window,
+                cx,
+            )
+        });
 
         let smart_duration = config.duration < 0;
         let duration_default = if smart_duration {
@@ -413,6 +604,7 @@ impl WanApp {
             url_input,
             duration,
             images: Vec::new(),
+            list_state,
             phase: Phase::Idle,
             progress: 0.0,
             notifications: Vec::new(),
@@ -677,6 +869,7 @@ impl WanApp {
                         }
                     }
                 }
+                this.sync_image_list(cx);
                 cx.notify();
             })
             .ok();
@@ -697,10 +890,23 @@ impl WanApp {
                 self.url_input.update(cx, |state, cx| {
                     state.set_value(SharedString::from(""), window, cx);
                 });
+                self.sync_image_list(cx);
                 cx.notify();
             }
             Err(error) => self.warn(format!("{error:#}"), cx),
         }
+    }
+
+    /// 把 `self.images` 整份灌进参考图列表。
+    ///
+    /// 只能在事件回调里调用：列表的重排/删除是自己改完 delegate 再写回主视图的，
+    /// 若在渲染期反过来读主视图会和它自己的 `Render` 借冲突。
+    fn sync_image_list(&mut self, cx: &mut Context<Self>) {
+        let items = self.images.clone();
+        self.list_state.update(cx, |state, cx| {
+            state.delegate_mut().items = items;
+            cx.notify();
+        });
     }
 
     // ---------------------------------------------------------------- 生成流程
@@ -1058,82 +1264,20 @@ impl WanApp {
     }
 
     fn render_images(&mut self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
-        let mut list = v_flex().gap_2().w_full();
+        let count = self.images.len();
 
-        if self.images.is_empty() {
-            list = list.child(div().text_sm().text_color(p.muted_fg).child(
-                "还没有参考图：点击「选择本地图片」，或把图片直接拖进窗口，也可以粘贴公网图片地址。",
-            ));
-        }
-
-        for index in 0..self.images.len() {
-            let image = self.images[index].clone();
-            let mut row = h_flex()
-                .gap_3()
-                .items_center()
-                .w_full()
-                .p_2()
-                .rounded(p.radius)
-                .border_1()
-                .border_color(p.border);
-
-            row = match image.preview.clone() {
-                Some(path) => row.child(
-                    img(path)
-                        .w(px(72.))
-                        .h(px(54.))
-                        .rounded(p.radius)
-                        .object_fit(ObjectFit::Cover),
-                ),
-                None => row.child(
-                    v_flex()
-                        .w(px(72.))
-                        .h(px(54.))
-                        .items_center()
-                        .justify_center()
-                        .rounded(p.radius)
-                        .bg(p.muted)
-                        .child(div().text_sm().text_color(p.muted_fg).child("URL")),
-                ),
-            };
-
-            let mut meta = v_flex()
-                .gap_1()
-                .flex_1()
-                .child(
-                    div()
-                        .text_sm()
-                        .child(SharedString::from(image.label.clone())),
-                )
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(p.muted_fg)
-                        .child(SharedString::from(image.info.clone())),
-                );
-            if let Some(note) = image.note.clone() {
-                meta = meta.child(
-                    div()
-                        .text_sm()
-                        .text_color(p.muted_fg)
-                        .child(SharedString::from(note)),
-                );
-            }
-
-            row = row.child(meta).child(
-                Button::new(ElementId::Name(format!("remove-image:{index}").into()))
-                    .label("移除")
-                    .outline()
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        if index < this.images.len() {
-                            this.images.remove(index);
-                        }
-                        cx.notify();
-                    })),
-            );
-
-            list = list.child(row);
-        }
+        // 列表为空时换成一行提示，避免 0 高度的虚拟列表
+        let list: AnyElement = if count == 0 {
+            div()
+                .text_sm()
+                .text_color(p.muted_fg)
+                .child("还没有参考图：点击「选择本地图片」，或把图片直接拖进窗口，也可以粘贴公网图片地址。")
+                .into_any_element()
+        } else {
+            List::new(&self.list_state)
+                .max_h(px(300.))
+                .into_any_element()
+        };
 
         let controls = h_flex()
             .gap_2()
@@ -1161,6 +1305,7 @@ impl WanApp {
                     .outline()
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.images.clear();
+                        this.sync_image_list(cx);
                         cx.notify();
                     })),
             );
@@ -1173,8 +1318,7 @@ impl WanApp {
                     .text_sm()
                     .text_color(p.muted_fg)
                     .child(SharedString::from(format!(
-                        "已选 {}/{} 张 · 本地图片自动转 Base64 上传（单张 ≤ 20MB，超限会自动压缩）",
-                        self.images.len(),
+                        "已选 {count}/{} 张 · 按住某一行拖动可调整顺序（顺序即「图1」「图2」的引用顺序）· 本地图片自动转 Base64 上传（单张 ≤ 20MB，超限会自动压缩）",
                         media::MAX_IMAGES
                     ))),
             )
@@ -1520,5 +1664,43 @@ impl Render for WanApp {
                 ),
             )
             .child(footer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reorder;
+
+    /// 拖动重排直接决定「图1」「图2」的引用顺序，必须准确。
+    #[test]
+    fn reorder_moves_item_to_target_position() {
+        let mut items = vec!["A", "B", "C"];
+
+        // A 拖到第 3 行（末尾）
+        assert!(reorder(&mut items, 0, 2));
+        assert_eq!(items, ["B", "C", "A"]);
+
+        // A 再拖回第一行
+        assert!(reorder(&mut items, 2, 0));
+        assert_eq!(items, ["A", "B", "C"]);
+
+        // 中间插入
+        assert!(reorder(&mut items, 0, 1));
+        assert_eq!(items, ["B", "A", "C"]);
+    }
+
+    #[test]
+    fn reorder_rejects_noop_and_out_of_range() {
+        let mut items = vec!["A", "B", "C"];
+
+        assert!(!reorder(&mut items, 1, 1));
+        assert_eq!(items, ["A", "B", "C"]);
+
+        assert!(!reorder(&mut items, 0, 3));
+        assert!(!reorder(&mut items, 3, 0));
+        assert_eq!(items, ["A", "B", "C"]);
+
+        let mut empty: Vec<&str> = Vec::new();
+        assert!(!reorder(&mut empty, 0, 0));
     }
 }
