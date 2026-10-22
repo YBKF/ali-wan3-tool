@@ -8,9 +8,9 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use gpui_kit::base::StyledExt;
-use gpui_kit::component::Sizable;
+use gpui_kit::base::{Link, StyledExt};
 use gpui_kit::component::status_bar::StatusBar;
+use gpui_kit::component::{ActiveTheme, Sizable};
 use gpui_kit::component::{
     Disableable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
@@ -28,9 +28,11 @@ use gpui_kit::{
     AnyElement, ClickEvent, Context, Entity, ExternalPaths, PathPromptOptions, Render,
     SharedString, Subscription, Window, div, px,
 };
+use semver::Version;
 
 use crate::api::{self, CreateRequest, MediaItem, Parameters, RequestInput, Usage};
 use crate::config::{Config, MAX_DURATION, MIN_DURATION, MODELS, RATIOS, REGIONS, RESOLUTIONS};
+use crate::constants::VERSION;
 use crate::media::{self, RefImage};
 use crate::ref_images::RefImagesDelegate;
 use crate::settings::SettingsForm;
@@ -38,6 +40,7 @@ use crate::task::{
     self, Debouncer, Phase, PhaseKind, PollOutcome, ResultInfo, download_with_progress, offload,
     poll_until_done, update_view, write_after_debounce,
 };
+use crate::types::update::RepoVersion;
 use crate::ui::{self, Palette};
 
 /// 提示词停止输入后多久落盘
@@ -65,6 +68,7 @@ pub struct WanApp {
     output_dir: Entity<InputState>,
     region_index: usize,
     settings_auto_opened: bool,
+    update_available_dialog_opened: bool,
 
     prompt: Entity<TextareaState>,
     url_input: Entity<InputState>,
@@ -163,6 +167,7 @@ impl WanApp {
             audio: config.audio,
             smart_duration,
             settings_auto_opened: false,
+            update_available_dialog_opened: false,
             config,
             api_key,
             workspace_id,
@@ -309,7 +314,7 @@ impl WanApp {
 
     // ---------------------------------------------------------------- 连接设置弹窗
 
-    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_settings_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let owner = cx.weak_entity();
         let api_key = self.api_key.clone();
         let workspace_id = self.workspace_id.clone();
@@ -341,6 +346,42 @@ impl WanApp {
                             }),
                     ),
             )
+        });
+    }
+
+    // ---------------------------------------------------------------- 更新检查弹窗
+    fn open_update_available_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            let theme = cx.theme();
+
+            dialog
+                .title("有新版本可用")
+                .child(
+                    v_flex().child(
+                        Link::new("update-release-addr")
+                            .href("https://gitee.com/YBKF/ali-wan3-tool/releases/latest")
+                            .open_with(|href, _, _, cx| cx.open_url(href))
+                            .cursor_pointer()
+                            .h_7()
+                            .px_3()
+                            .py_0()
+                            .flex()
+                            .items_center()
+                            .border_1()
+                            .border_color(theme.border)
+                            .text_color(theme.link)
+                            .font_light()
+                            .child("打开最新发布版页面 →"),
+                    ),
+                )
+                .footer(
+                    DialogFooter::new().child(
+                        Button::new("update-close")
+                            .label("关闭")
+                            .outline()
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    ),
+                )
         });
     }
 
@@ -738,7 +779,7 @@ impl WanApp {
                             .label("连接设置")
                             .outline()
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                this.open_settings(window, cx)
+                                this.open_settings_dialog(window, cx)
                             })),
                     ),
             )
@@ -1119,9 +1160,60 @@ impl Render for WanApp {
             if self.api_key.read(cx).value().trim().is_empty() {
                 let entity = cx.entity();
                 window.defer(cx, move |window, cx| {
-                    entity.update(cx, |this, cx| this.open_settings(window, cx));
+                    entity.update(cx, |this, cx| this.open_settings_dialog(window, cx));
                 });
             }
+        }
+
+        // TODO 检查到远端仓库最新发布版的版本号大于本地版本时，弹出窗口提示手动下载更新
+        if !self.update_available_dialog_opened {
+            self.update_available_dialog_opened = true;
+            cx.spawn_in(window, async move |this, cx| {
+                this.update_in(cx, |state, window, cx| {
+                    // GitHub 与 Gitee 的 release JSON 结构相同，依次尝试
+                    const SOURCES: [&str; 2] = [
+                        "https://gitee.com/api/v5/repos/YBKF/ali-wan3-tool/releases/latest",
+                        "https://api.github.com/repos/YBKF/ali-wan3-tool/releases/latest",
+                    ];
+
+                    let Ok(local) = Version::parse(VERSION) else {
+                        state.warn(format!("本地版本号无法解析：{VERSION}"), cx);
+                        return;
+                    };
+
+                    let mut remote = None;
+                    for (i, url) in SOURCES.iter().enumerate() {
+                        let fetched = ureq::get(*url)
+                            .call()
+                            .map_err(|e| e.to_string())
+                            .and_then(|mut r| {
+                                r.body_mut()
+                                    .read_json::<RepoVersion>()
+                                    .map_err(|e| e.to_string())
+                            })
+                            .and_then(|repo| Version::try_from(repo).map_err(|e| e.to_string()));
+
+                        match fetched {
+                            Ok(version) => {
+                                remote = Some(version);
+                                break;
+                            }
+                            // 还有备用源时提示切换，最后一个源失败就直接报错
+                            Err(e) if i + 1 < SOURCES.len() => {
+                                state.warn(format!("{e} 已切换至下一个源"), cx)
+                            }
+                            Err(e) => state.warn(e, cx),
+                        }
+                    }
+
+                    // 远端版本大于本地版本则弹出更新弹窗
+                    if remote.is_some_and(|remote| remote > local) {
+                        state.open_update_available_dialog(window, cx);
+                    }
+                })
+                .ok();
+            })
+            .detach();
         }
 
         let p = ui::Palette::new(cx);

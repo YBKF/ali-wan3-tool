@@ -20,10 +20,12 @@
 mod api;
 mod app;
 mod config;
+mod constants;
 mod media;
 mod ref_images;
 mod settings;
 mod task;
+mod types;
 mod ui;
 
 use gpui_kit::prelude::*;
