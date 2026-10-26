@@ -1200,9 +1200,9 @@ impl Render for WanApp {
                             }
                             // 还有备用源时提示切换，最后一个源失败就直接报错
                             Err(e) if i + 1 < SOURCES.len() => {
-                                state.warn(format!("{e} 已切换至下一个源"), cx)
+                                state.warn(format!("检查更新：{e} 已切换至下一个源"), cx)
                             }
-                            Err(e) => state.warn(e, cx),
+                            Err(e) => state.warn(format!("检查更新：{e}"), cx),
                         }
                     }
 
