@@ -62,14 +62,17 @@ pub fn hint(p: &Palette, text: impl Into<SharedString>) -> AnyElement {
         .into_any_element()
 }
 
-/// 卡片：标题 + 可选副标题 + 内容。
+/// 卡片：可选标题 + 可选副标题 + 内容。
 pub fn section(
     p: &Palette,
-    title: &'static str,
+    title: Option<&'static str>,
     subtitle: Option<&'static str>,
     body: AnyElement,
 ) -> AnyElement {
-    let mut head = v_flex().gap_1().child(Label::new(title));
+    let mut head: gpui_kit::Div = v_flex().gap_1();
+    if let Some(title) = title {
+        head = head.child(Label::new(title));
+    }
     if let Some(subtitle) = subtitle {
         head = head.child(hint(p, subtitle));
     }

@@ -40,6 +40,7 @@ use crate::task::{
     self, Debouncer, Phase, PhaseKind, PollOutcome, ResultInfo, download_with_progress, offload,
     poll_until_done, update_view, write_after_debounce,
 };
+use crate::templates_ui::PromptTemplatesDialog;
 use crate::types::update::RepoVersion;
 use crate::ui::{self, Palette};
 
@@ -310,6 +311,43 @@ impl WanApp {
             });
         })
         .detach();
+    }
+
+    /// 把 `text` 替换到提示词输入框。
+    pub(crate) fn replace_prompt(
+        &mut self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.prompt.update(cx, |state, cx| {
+            state.set_value(SharedString::new(text), window, cx);
+        });
+        self.mark_prompt_dirty(cx);
+        cx.notify();
+    }
+
+    // ---------------------------------------------------------------- 提示词模版弹窗
+
+    fn open_prompt_templates_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let owner = cx.weak_entity();
+        let panel = cx.new(|_| PromptTemplatesDialog::new(owner));
+
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            let panel = panel.clone();
+            dialog
+                .title("提示词模版管理")
+                .w(px(640.))
+                .child(panel)
+                .footer(
+                    DialogFooter::new().child(
+                        Button::new("prompt-templates-close")
+                            .label("关闭")
+                            .outline()
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    ),
+                )
+        });
     }
 
     // ---------------------------------------------------------------- 连接设置弹窗
@@ -786,7 +824,7 @@ impl WanApp {
             .into_any_element()
     }
 
-    fn render_prompt(&mut self, p: &Palette, _cx: &mut Context<Self>) -> AnyElement {
+    fn render_prompt(&mut self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let status = self
             .prompt_status
             .clone()
@@ -794,6 +832,16 @@ impl WanApp {
         let body = v_flex()
             .gap_2()
             .w_full()
+            .child(
+                h_flex().w_full().items_center().gap_3().child(
+                    Button::new("manage-prompt-templates")
+                        .label("管理提示词模版")
+                        .primary()
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.open_prompt_templates_dialog(window, cx)
+                        })),
+                ),
+            )
             .child(ui::scroll_contained(Textarea::new(&self.prompt).w_full()))
             .child(ui::hint(
                 p,
@@ -808,7 +856,7 @@ impl WanApp {
             ))
             .into_any_element();
 
-        ui::section(p, "提示词 prompt", None, body)
+        ui::section(p, Some("提示词 prompt"), None, body)
     }
 
     fn render_images(&mut self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
@@ -876,7 +924,12 @@ impl WanApp {
             }))
             .into_any_element();
 
-        ui::section(p, "参考图 reference_image", Some("最多 10 张参考图"), body)
+        ui::section(
+            p,
+            Some("参考图 reference_image"),
+            Some("最多 10 张参考图"),
+            body,
+        )
     }
 
     fn render_params(&mut self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
@@ -981,7 +1034,7 @@ impl WanApp {
 
         ui::section(
             p,
-            "生成参数 parameters",
+            Some("生成参数 parameters"),
             Some(
                 "修改后自动保存到 config.json；resolution / ratio / duration / audio 会原样写入请求体",
             ),
@@ -1066,7 +1119,7 @@ impl WanApp {
 
         body = body.child(actions);
 
-        ui::section(p, "生成结果", None, body.into_any_element())
+        ui::section(p, Some("生成结果"), None, body.into_any_element())
     }
 
     fn render_footer(&mut self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
@@ -1165,7 +1218,7 @@ impl Render for WanApp {
             }
         }
 
-        // TODO 检查到远端仓库最新发布版的版本号大于本地版本时，弹出窗口提示手动下载更新
+        // 检查到远端仓库最新发布版的版本号大于本地版本时，弹出窗口提示手动下载更新
         if !self.update_available_dialog_opened {
             self.update_available_dialog_opened = true;
             cx.spawn_in(window, async move |this, cx| {

@@ -14,6 +14,8 @@
 //! | [`ref_images`] | 参考图列表：虚拟化 `List` 与拖拽重排 |
 //! | [`settings`] | 连接设置弹窗 |
 //! | [`task`] | 生成任务的阶段状态机与异步管线 |
+//! | [`templates`] | 提示词模版（`video_gen_prompt` 目录下的 `*.prompt.txt`） |
+//! | [`templates_ui`] | 提示词模版管理弹窗与新建模版弹窗 |
 //! | [`ui`] | 展示层公共件：主题取色、卡片、表单行、分段选择器 |
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
@@ -25,6 +27,8 @@ mod media;
 mod ref_images;
 mod settings;
 mod task;
+mod templates;
+mod templates_ui;
 mod types;
 mod ui;
 
@@ -33,7 +37,8 @@ use gpui_kit::{SharedString, TitlebarOptions, WindowBounds, WindowOptions, px, s
 
 fn main() {
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        // 完整图标库：模版列表要用到默认包里没有的铅笔 / 垃圾桶图标
+        .with_assets(gpui_kit::assets::AllAssets)
         .run(|cx| {
             gpui_kit::init(cx);
 
