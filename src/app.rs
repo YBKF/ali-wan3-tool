@@ -79,6 +79,8 @@ pub struct WanApp {
     ratio_index: usize,
     model_index: usize,
     audio: bool,
+    /// 单实例模式：只在启动时读取，运行中改动下次启动才生效
+    single_instance: bool,
 
     images: Vec<RefImage>,
     /// 参考图列表（虚拟化 + 拖拽重排）；顺序即「图1」「图2」的引用顺序
@@ -166,6 +168,7 @@ impl WanApp {
                 .position(|value| *value == config.ratio)
                 .unwrap_or(0),
             audio: config.audio,
+            single_instance: config.single_instance,
             smart_duration,
             settings_auto_opened: false,
             update_available_dialog_opened: false,
@@ -215,6 +218,7 @@ impl WanApp {
         config.resolution = RESOLUTIONS[self.resolution_index].to_string();
         config.ratio = RATIOS[self.ratio_index].to_string();
         config.audio = self.audio;
+        config.single_instance = self.single_instance;
         config.duration = if self.smart_duration {
             -1
         } else {
@@ -812,6 +816,15 @@ impl WanApp {
                     .gap_3()
                     .items_center()
                     .child(ui::hint(p, self.endpoint_summary(cx)))
+                    .child(
+                        Switch::new("single-instance-switch")
+                            .label("单实例模式 · 重启生效")
+                            .checked(self.single_instance)
+                            .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                                this.single_instance = *checked;
+                                this.mark_config_dirty(CONFIG_SAVE_DELAY, cx);
+                            })),
+                    )
                     .child(
                         Button::new("open-settings")
                             .label("连接设置")

@@ -40,6 +40,9 @@ pub struct Config {
     /// 秒；`-1` 表示智能时长
     pub duration: i32,
     pub audio: bool,
+    /// 单实例模式：开启后重复启动只会唤醒已有窗口，不再开新进程。
+    /// 只在启动时读取，改动需重启生效。
+    pub single_instance: bool,
 }
 
 impl Default for Config {
@@ -54,6 +57,7 @@ impl Default for Config {
             ratio: "adaptive".to_string(),
             duration: 5,
             audio: false,
+            single_instance: false,
         }
     }
 }
@@ -156,6 +160,8 @@ mod tests {
         assert_eq!(config.duration, -1);
         assert_eq!(config.region, "cn-beijing");
         assert!(!config.audio);
+        // 老配置文件没有这个字段，默认关闭单实例
+        assert!(!config.single_instance);
     }
 
     /// 提示词单独落盘，能原样读回。

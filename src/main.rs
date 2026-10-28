@@ -37,10 +37,19 @@ mod ui;
 use gpui_kit::prelude::*;
 use gpui_kit::{SharedString, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 
+use crate::config::Config;
+use crate::single_instance::SingleInstance;
+
 fn main() {
-    // 单实例：已经有实例在跑就先唤醒它，然后直接退出
-    let Some(single_instance) = single_instance::SingleInstance::claim() else {
-        return;
+    // 单实例模式默认关闭，只有配置里显式开启才生效；改动需重启。
+    // 已有实例在跑时先唤醒它，然后安静退出。
+    let single_instance = if Config::load().single_instance {
+        match SingleInstance::claim() {
+            Some(handle) => Some(handle),
+            None => return,
+        }
+    } else {
+        None
     };
 
     gpui_kit::application()
@@ -65,7 +74,9 @@ fn main() {
             })
             .expect("无法创建主窗口");
 
-            // 第二次启动时把主窗口恢复到最前
-            single_instance.watch(window, cx);
+            // 第二次启动时把主窗口恢复到最前；没开单实例模式就没有监听的必要
+            if let Some(single_instance) = &single_instance {
+                single_instance.watch(window, cx);
+            }
         });
 }
