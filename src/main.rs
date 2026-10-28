@@ -13,6 +13,7 @@
 //! | [`media`] | 参考图校验、压缩与 Base64 编码 |
 //! | [`ref_images`] | 参考图列表：虚拟化 `List` 与拖拽重排 |
 //! | [`settings`] | 连接设置弹窗 |
+//! | [`single_instance`] | 单实例：重复启动时唤醒已运行的窗口 |
 //! | [`task`] | 生成任务的阶段状态机与异步管线 |
 //! | [`templates`] | 提示词模版（`video_gen_prompt` 目录下的 `*.prompt.txt`） |
 //! | [`templates_ui`] | 提示词模版管理弹窗与新建模版弹窗 |
@@ -26,6 +27,7 @@ mod constants;
 mod media;
 mod ref_images;
 mod settings;
+mod single_instance;
 mod task;
 mod templates;
 mod templates_ui;
@@ -36,10 +38,15 @@ use gpui_kit::prelude::*;
 use gpui_kit::{SharedString, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 
 fn main() {
+    // 单实例：已经有实例在跑就先唤醒它，然后直接退出
+    let Some(single_instance) = single_instance::SingleInstance::claim() else {
+        return;
+    };
+
     gpui_kit::application()
         // 完整图标库：模版列表要用到默认包里没有的铅笔 / 垃圾桶图标
         .with_assets(gpui_kit::assets::AllAssets)
-        .run(|cx| {
+        .run(move |cx| {
             gpui_kit::init(cx);
 
             let options = WindowOptions {
@@ -53,9 +60,12 @@ fn main() {
                 ..Default::default()
             };
 
-            gpui_kit::open_window(options, cx, |window, cx| {
+            let (window, _view) = gpui_kit::open_window(options, cx, |window, cx| {
                 cx.new(|cx| app::WanApp::new(window, cx))
             })
             .expect("无法创建主窗口");
+
+            // 第二次启动时把主窗口恢复到最前
+            single_instance.watch(window, cx);
         });
 }

@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+app-single-instance = "0.1"
 base64 = "0.22"
 chrono = "0.4"
 gpui-kit = "0.8"
