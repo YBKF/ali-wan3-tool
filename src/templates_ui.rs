@@ -68,9 +68,10 @@ impl PromptTemplatesDialog {
     fn reload(&mut self, cx: &mut Context<Self>) {
         self.templates = templates::list_in(&self.dir);
         // 正在改名的那一行可能已经被删掉，编辑状态也就没意义了
-        let editing_gone = self.editing.as_ref().is_some_and(|editing| {
-            !self.templates.iter().any(|item| item.path == editing.path)
-        });
+        let editing_gone = self
+            .editing
+            .as_ref()
+            .is_some_and(|editing| !self.templates.iter().any(|item| item.path == editing.path));
         if editing_gone {
             self.editing = None;
         }
@@ -306,7 +307,10 @@ impl Render for PromptTemplatesDialog {
                     let rename_target = template.clone();
 
                     // 这一行正在改名：标题位置换成输入框，错误提示挂在下面
-                    let editing = self.editing.as_ref().filter(|edit| edit.path == template.path);
+                    let editing = self
+                        .editing
+                        .as_ref()
+                        .filter(|edit| edit.path == template.path);
                     let title_cell: AnyElement = match editing {
                         Some(edit) => {
                             let save = Button::new(ElementId::Name(
@@ -316,9 +320,9 @@ impl Render for PromptTemplatesDialog {
                             .ghost()
                             .xsmall()
                             .tooltip("保存修改")
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.commit_rename(cx)
-                            }));
+                            .on_click(
+                                cx.listener(|this, _: &ClickEvent, _, cx| this.commit_rename(cx)),
+                            );
 
                             let mut cell = v_flex()
                                 .flex_1()
@@ -326,8 +330,8 @@ impl Render for PromptTemplatesDialog {
                                 .gap_1()
                                 .child(Input::new(&edit.input).small().suffix(save));
                             if let Some(error) = edit.error.clone() {
-                                cell = cell
-                                    .child(div().text_sm().text_color(p.danger).child(error));
+                                cell =
+                                    cell.child(div().text_sm().text_color(p.danger).child(error));
                             }
                             cell.into_any_element()
                         }

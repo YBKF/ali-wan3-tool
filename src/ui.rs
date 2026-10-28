@@ -3,8 +3,12 @@
 //! 这里只放与业务无关的东西，任何视图都可以直接复用；业务逻辑一律不放在这里。
 
 use gpui_kit::component::{
-    ActiveTheme as _, button::{Button, ButtonVariants as _}, h_flex, input::InputState,
-    label::Label, v_flex,
+    ActiveTheme as _,
+    button::{Button, ButtonVariants as _},
+    h_flex,
+    input::InputState,
+    label::Label,
+    v_flex,
 };
 use gpui_kit::prelude::*;
 use gpui_kit::{
@@ -136,7 +140,11 @@ where
         })
         .collect();
 
-    h_flex().flex_wrap().gap_2().children(chips).into_any_element()
+    h_flex()
+        .flex_wrap()
+        .gap_2()
+        .children(chips)
+        .into_any_element()
 }
 
 /// 单行输入框，构造时一并给定占位符与初始值。
@@ -166,7 +174,7 @@ pub fn text_input(
 pub fn scroll_contained(child: impl IntoElement) -> AnyElement {
     div()
         .w_full()
-        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+        .on_scroll(|_, _, cx| cx.stop_propagation())
         .child(child)
         .into_any_element()
 }

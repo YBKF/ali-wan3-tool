@@ -15,10 +15,7 @@ pub const REGIONS: &[(&str, &str)] = &[
 ];
 
 /// 模型列表：(显示名, model 标识)。
-pub const MODELS: &[(&str, &str)] = &[
-    ("标准版", "wan3.0-video"),
-    ("高速版", "wan3.0-video-prime"),
-];
+pub const MODELS: &[(&str, &str)] = &[("标准版", "wan3.0-video"), ("高速版", "wan3.0-video-prime")];
 
 /// `parameters.resolution`
 pub const RESOLUTIONS: &[&str] = &["480P", "720P", "1080P"];

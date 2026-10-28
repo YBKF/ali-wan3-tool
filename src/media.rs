@@ -1,6 +1,6 @@
 //! 参考图预处理：本地文件校验 / 压缩 / 转 Base64 data URI，以及公网 URL 的简单校验。
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use base64::Engine as _;
 use std::path::{Path, PathBuf};
 
@@ -41,8 +41,8 @@ pub fn prepare_local(path: &Path) -> Result<RefImage> {
         .to_ascii_lowercase();
     let mime = mime_for(&extension)?;
 
-    let metadata = std::fs::metadata(path)
-        .with_context(|| format!("无法读取文件 {}", path.display()))?;
+    let metadata =
+        std::fs::metadata(path).with_context(|| format!("无法读取文件 {}", path.display()))?;
     let raw_len = metadata.len();
     if raw_len == 0 {
         bail!("文件为空");
@@ -149,7 +149,11 @@ fn compress(path: &Path) -> Result<Vec<u8>> {
     let source = if scale < 1.0 {
         let target_width = ((width as f64 * scale).round() as u32).max(1);
         let target_height = ((height as f64 * scale).round() as u32).max(1);
-        source.resize(target_width, target_height, image::imageops::FilterType::Lanczos3)
+        source.resize(
+            target_width,
+            target_height,
+            image::imageops::FilterType::Lanczos3,
+        )
     } else {
         source
     };
@@ -158,7 +162,12 @@ fn compress(path: &Path) -> Result<Vec<u8>> {
     let mut buffer = Vec::new();
     let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buffer, 88);
     encoder
-        .encode(rgb.as_raw(), rgb.width(), rgb.height(), image::ExtendedColorType::Rgb8)
+        .encode(
+            rgb.as_raw(),
+            rgb.width(),
+            rgb.height(),
+            image::ExtendedColorType::Rgb8,
+        )
         .with_context(|| "JPEG 编码失败")?;
     Ok(buffer)
 }

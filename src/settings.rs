@@ -77,7 +77,9 @@ impl SettingsForm {
 
         let outcome = self
             .owner
-            .update(cx, |app, cx| app.apply_connection_settings(region_index, cx))
+            .update(cx, |app, cx| {
+                app.apply_connection_settings(region_index, cx)
+            })
             .unwrap_or(Ok(()));
 
         self.saved_hint = Some(match outcome {

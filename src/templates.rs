@@ -152,7 +152,8 @@ pub fn rename(path: &Path, new_title: &str) -> Result<PathBuf> {
         .into_iter()
         .any(|other| other.path != path && other.title.to_lowercase() == lowered);
     // 只改大小写时目标路径「存在」是同一个文件，不算重名
-    let same_file = target.to_string_lossy().to_lowercase() == path.to_string_lossy().to_lowercase();
+    let same_file =
+        target.to_string_lossy().to_lowercase() == path.to_string_lossy().to_lowercase();
     if taken || (target.exists() && !same_file) {
         return Err(anyhow!("模版「{title}」已存在，请换一个标题"));
     }

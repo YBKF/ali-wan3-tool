@@ -6,7 +6,7 @@
 //! - 结果链接与 task_id 均只有 24 小时有效，故生成后立即下载
 
 use crate::config::Config;
-use anyhow::{anyhow, bail, Context as _, Result};
+use anyhow::{Context as _, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::io::{Read as _, Write as _};
 use std::path::Path;
@@ -169,8 +169,12 @@ pub fn create_task(config: &Config, request: &CreateRequest) -> Result<String> {
     let status = response.status().as_u16();
     let body = response.body_mut().read_to_string().unwrap_or_default();
 
-    let envelope: CreateEnvelope = serde_json::from_str(&body)
-        .map_err(|_| anyhow!("服务端返回的不是 JSON（HTTP {status}）：{}", truncate(&body)))?;
+    let envelope: CreateEnvelope = serde_json::from_str(&body).map_err(|_| {
+        anyhow!(
+            "服务端返回的不是 JSON（HTTP {status}）：{}",
+            truncate(&body)
+        )
+    })?;
 
     if let Some(task_id) = envelope.output.as_ref().and_then(|o| o.task_id.clone()) {
         return Ok(task_id);
@@ -179,10 +183,16 @@ pub fn create_task(config: &Config, request: &CreateRequest) -> Result<String> {
     if let Some(output) = envelope.output.as_ref()
         && let Some(message) = output.message.as_ref()
     {
-        bail!("创建任务失败：{} {message}", output.code.clone().unwrap_or_default());
+        bail!(
+            "创建任务失败：{} {message}",
+            output.code.clone().unwrap_or_default()
+        );
     }
     if let Some(message) = envelope.message.as_ref() {
-        bail!("创建任务失败：{} {message}", envelope.code.clone().unwrap_or_default());
+        bail!(
+            "创建任务失败：{} {message}",
+            envelope.code.clone().unwrap_or_default()
+        );
     }
     bail!("创建任务失败（HTTP {status}）：{}", truncate(&body));
 }
@@ -204,11 +214,17 @@ pub fn query_task(config: &Config, task_id: &str) -> Result<TaskOutcome> {
         .map_err(|_| anyhow!("查询返回的不是 JSON（HTTP {status}）：{}", truncate(&body)))?;
 
     if let Some(message) = envelope.message.as_ref() {
-        bail!("查询任务失败：{} {message}", envelope.code.clone().unwrap_or_default());
+        bail!(
+            "查询任务失败：{} {message}",
+            envelope.code.clone().unwrap_or_default()
+        );
     }
 
     let output = envelope.output.as_ref().ok_or_else(|| {
-        anyhow!("查询返回缺少 output 字段（HTTP {status}）：{}", truncate(&body))
+        anyhow!(
+            "查询返回缺少 output 字段（HTTP {status}）：{}",
+            truncate(&body)
+        )
     })?;
 
     match output.task_status.as_deref().unwrap_or("UNKNOWN") {
@@ -226,7 +242,10 @@ pub fn query_task(config: &Config, task_id: &str) -> Result<TaskOutcome> {
         }
         "FAILED" | "CANCELED" => Ok(TaskOutcome::Failed {
             code: output.code.clone().unwrap_or_else(|| "Unknown".to_string()),
-            message: output.message.clone().unwrap_or_else(|| "任务执行失败".to_string()),
+            message: output
+                .message
+                .clone()
+                .unwrap_or_else(|| "任务执行失败".to_string()),
         }),
         "UNKNOWN" => bail!("任务不存在或已过期（task_id 有效期 24 小时）"),
         other => bail!("未知任务状态：{other}"),
@@ -320,7 +339,10 @@ mod tests {
         assert_eq!(value["model"], "wan3.0-video");
         assert_eq!(value["input"]["prompt"], "让图1里的人物转身");
         assert_eq!(value["input"]["media"][0]["type"], "reference_image");
-        assert_eq!(value["input"]["media"][0]["url"], "data:image/png;base64,AAAA");
+        assert_eq!(
+            value["input"]["media"][0]["url"],
+            "data:image/png;base64,AAAA"
+        );
         assert_eq!(value["parameters"]["resolution"], "720P");
         assert_eq!(value["parameters"]["ratio"], "16:9");
         assert_eq!(value["parameters"]["duration"], 5);

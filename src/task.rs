@@ -46,7 +46,9 @@ impl Phase {
     pub fn kind(&self) -> PhaseKind {
         match self {
             Phase::Idle => PhaseKind::Idle,
-            Phase::Submitting | Phase::Polling { .. } | Phase::Downloading { .. } => PhaseKind::Busy,
+            Phase::Submitting | Phase::Polling { .. } | Phase::Downloading { .. } => {
+                PhaseKind::Busy
+            }
             Phase::Done => PhaseKind::Done,
             Phase::Failed(_) => PhaseKind::Failed,
         }
