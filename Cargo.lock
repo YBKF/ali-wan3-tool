@@ -133,7 +133,7 @@ dependencies = [
 
 [[package]]
 name = "ali-wan3-tool"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "app-single-instance",
